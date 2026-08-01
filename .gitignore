@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pyt
+*.pdb
+*.log
+
+# Virtual environment
+.venv/
+venv/
+ENV/
+env/
+
+# Editor files
+.vscode/
+*.swp
+*.swo
+
+# Binary outputs
+*.exe
+*.dll
+*.obj
+*.o
+*.lib
+
+# Disassembly and rebuilt files
+*.txt
