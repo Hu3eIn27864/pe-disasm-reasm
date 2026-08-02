@@ -27,3 +27,8 @@ env/
 
 # Disassembly and rebuilt files
 *.txt
+
+# Generated binaries (ignore exact rebuild artifacts)
+header.bin
+rsrc.bin
+rebuilt_with_blobs.exe
