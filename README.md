@@ -71,6 +71,10 @@ python reassemble_x86_pe.py --disasm game_disasm_v2.txt --header-bin header.bin 
 - The template mode (`--input`) remains the simplest way to produce an exact-byte rebuild when the original EXE is available.
 - The repository now ignores generated blobs (`header.bin`, `rsrc.bin`, `rebuilt_with_blobs.exe`) via `.gitignore`.
 
+- Important: To produce a byte-for-byte identical rebuild you need access to the original `game.exe` file and a legally licensed copy of the game. Do not attempt to reconstruct or distribute binaries you do not own or have rights to.
+
+- Wichtig: Für eine exakte (byte-identische) Rekonstruktion wird die Original-EXE (`game.exe`) benötigt sowie eine rechtmäßig erworbene Kopie des Spiels. Verwende oder verbreite keine Binärdateien, die dir nicht gehören oder für die du keine Lizenz hast.
+
 ## GitHub push
 
 Push from your machine as usual (this repo already contains commits and was pushed in-session):
