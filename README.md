@@ -41,25 +41,43 @@ python reassemble_x86_pe.py --disasm game_disasm_v2.txt --output rebuilt_game.ex
 python reassemble_x86_pe.py --input game.exe --disasm game_disasm_v2.txt --output rebuilt_template_game.exe
 ```
 
+### Exact-byte rebuild using injected binaries
+
+If you need a byte-for-byte identical EXE but do not want to rely on the original at build-time,
+you can extract exact header/section blobs and inject them into the rebuilt output.
+
+1. Extract header and resource binaries (example helper):
+
+```powershell
+python extract_bins.py
+# writes header.bin and rsrc.bin
+```
+
+2. Rebuild using injected blobs:
+
+```powershell
+python reassemble_x86_pe.py --disasm game_disasm_v2.txt --header-bin header.bin --section-bin .rsrc=rsrc.bin --output rebuilt_with_blobs.exe
+```
+
+### New CLI options
+
+- `--header-bin PATH` : write the exact binary `PATH` at file offset 0 (useful to preserve DOS stub and PE header bytes).
+- `--section-bin NAME=PATH` : override the assembled contents of section `NAME` with the file at `PATH` (can be repeated).
+- `--inject OFF=PATH` : inject binary `PATH` at raw file offset `OFF` (hex or 0x-prefixed allowed).
+
 ## Notes
 
-- The template rebuild preserves original PE headers and section layout.
-- Use the `--entry` option only when you want to override the original entry point.
+- `keystone-engine` is required for assembling instructions back into bytes. Install with `pip install keystone-engine`.
+- The template mode (`--input`) remains the simplest way to produce an exact-byte rebuild when the original EXE is available.
+- The repository now ignores generated blobs (`header.bin`, `rsrc.bin`, `rebuilt_with_blobs.exe`) via `.gitignore`.
 
-## GitHub upload
+## GitHub push
 
-This environment does not have local `git` or `gh` available, so remote push is not possible here.
-
-To initialize and push from your machine:
+Push from your machine as usual (this repo already contains commits and was pushed in-session):
 
 ```powershell
 cd C:\Users\salma\Documents\vscode5
-git init
-git add .
-git commit -m "Add PE disassembler/reassembler scripts"
-# Create a private repo on GitHub using the website or GitHub CLI:
-# gh repo create <your-username>/<repo-name> --private
-# then:
-# git remote add origin https://github.com/<your-username>/<repo-name>.git
-# git push -u origin main
+git add README.md
+git commit -m "docs: update README with new rebuild options and examples"
+git push origin master
 ```
