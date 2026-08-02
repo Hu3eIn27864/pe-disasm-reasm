@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Reassemble a 32-bit x86 PE executable from an original EXE or from a disassembly listing."""
+"""Reassemble a 32-bit x86 PE executable from a disassembly listing.
+
+Features:
+- Assemble sections from disasm (requires keystone-engine).
+- Optionally inject a header binary (`--header-bin`) written at offset 0.
+- Optionally override section contents with `--section-bin NAME=PATH`.
+- Optionally inject arbitrary binaries at offsets with `--inject OFF=PATH`.
+- Template mode: if `--input <orig.exe>` is provided, use it as template and patch sections.
+"""
 
 import argparse
 import os
@@ -7,10 +15,11 @@ import re
 import shutil
 import struct
 import sys
+from pathlib import Path
 
 try:
     from keystone import Ks, KS_ARCH_X86, KS_MODE_32
-except ImportError:
+except Exception:
     Ks = None
 
 IMAGE_DOS_SIGNATURE = b"MZ"
@@ -24,41 +33,6 @@ DEFAULT_FILE_ALIGNMENT = 0x200
 
 def align(value, alignment):
     return ((value + alignment - 1) // alignment) * alignment
-
-
-def parse_pe(data):
-    if len(data) < 0x40 or data[:2] != IMAGE_DOS_SIGNATURE:
-        raise ValueError("Not a valid DOS header / PE file")
-
-    e_lfanew = struct.unpack_from("<I", data, 0x3C)[0]
-    if e_lfanew + 4 > len(data) or data[e_lfanew:e_lfanew + 4] != IMAGE_NT_SIGNATURE:
-        raise ValueError("Not a valid PE header")
-
-    file_header_offset = e_lfanew + 4
-    NumberOfSections = struct.unpack_from("<H", data, file_header_offset + 2)[0]
-    SizeOfOptionalHeader = struct.unpack_from("<H", data, file_header_offset + 16)[0]
-    optional_header_offset = file_header_offset + 20
-    section_table_offset = optional_header_offset + SizeOfOptionalHeader
-
-    sections = []
-    for i in range(NumberOfSections):
-        offset = section_table_offset + i * IMAGE_SIZEOF_SECTION_HEADER
-        if offset + IMAGE_SIZEOF_SECTION_HEADER > len(data):
-            break
-        name = data[offset:offset + 8].rstrip(b"\x00").decode("ascii", errors="ignore")
-        VirtualSize, VirtualAddress, SizeOfRawData, PointerToRawData, _, _, _, _, Characteristics = struct.unpack_from(
-            "<IIIIIIHHI", data, offset + 8
-        )
-        sections.append({
-            "name": name,
-            "virtual_size": VirtualSize,
-            "virtual_address": VirtualAddress,
-            "raw_size": SizeOfRawData,
-            "raw_ptr": PointerToRawData,
-            "characteristics": Characteristics,
-        })
-
-    return sections
 
 
 def parse_bytes_comment(comment):
@@ -93,502 +67,348 @@ def parse_db_bytes(text):
 
 def parse_disasm_listing(path, image_base=DEFAULT_IMAGE_BASE):
     sections = []
-    current_section = None
+    current = None
+    section_marker = re.compile(r"^;\s*SECTION\s+(\S+).*?raw_offset=0x([0-9A-Fa-f]+).*?raw_size=0x([0-9A-Fa-f]+).*?va=0x([0-9A-Fa-f]+)")
+    line_re = re.compile(r"^\s*0x([0-9A-Fa-f]+):\s*(.*)$")
 
-    section_marker = re.compile(
-        r"^;\s*SECTION\s+(\S+).*?raw_offset=0x([0-9A-Fa-f]+).*?raw_size=0x([0-9A-Fa-f]+).*?va=0x([0-9A-Fa-f]+)"
-    )
-    line_pattern = re.compile(r"^\s*0x([0-9A-Fa-f]+):\s*(.*)$")
-    db_line = re.compile(r"^db\s+(.*)$", re.IGNORECASE)
+    def start_section(name, va, raw_offset, raw_size):
+        nonlocal current
+        current = {"name": name, "va": va, "raw_offset": raw_offset, "raw_size": raw_size, "entries": []}
+        sections.append(current)
 
-    def start_section(name, virtual_address, raw_offset, raw_size):
-        nonlocal current_section
-        current_section = {
-            "name": name,
-            "va": virtual_address,
-            "raw_offset": raw_offset,
-            "raw_size": raw_size,
-            "entries": [],
-        }
-        sections.append(current_section)
-
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+    with open(path, 'r', encoding='utf-8', errors='ignore') as f:
         for line in f:
-            line = line.rstrip("\n")
+            line = line.rstrip('\n')
             if not line:
                 continue
-
-            marker = section_marker.match(line)
-            if marker:
-                name = marker.group(1)
-                raw_offset = int(marker.group(2), 16)
-                raw_size = int(marker.group(3), 16)
-                va = int(marker.group(4), 16)
+            m = section_marker.match(line)
+            if m:
+                name = m.group(1)
+                raw_offset = int(m.group(2), 16)
+                raw_size = int(m.group(3), 16)
+                va = int(m.group(4), 16)
                 if va >= image_base:
                     va -= image_base
                 start_section(name, va, raw_offset, raw_size)
                 continue
-
-            line_match = line_pattern.match(line)
-            if not line_match:
+            lm = line_re.match(line)
+            if not lm:
                 continue
-
-            addr = int(line_match.group(1), 16)
-            payload = line_match.group(2).strip()
-            comment_split = payload.split(";", 1)
-            opcode_part = comment_split[0].strip()
-            comment_part = comment_split[1].strip() if len(comment_split) > 1 else None
+            addr = int(lm.group(1), 16)
+            payload = lm.group(2).strip()
+            parts = payload.split(';', 1)
+            opcode = parts[0].strip()
+            comment = parts[1].strip() if len(parts) > 1 else None
             raw_bytes = None
-            if comment_part:
-                raw_bytes = parse_bytes_comment(comment_part)
-
-            if opcode_part.lower().startswith("db"):
-                raw_bytes = parse_db_bytes(opcode_part[2:].strip())
-                if current_section is None:
-                    start_section(".text", align(addr - image_base, DEFAULT_SECTION_ALIGNMENT))
-                current_section["entries"].append({
-                    "address": addr,
-                    "asm": None,
-                    "raw_bytes": raw_bytes,
-                })
-                continue
-
-            if opcode_part:
-                if current_section is None:
-                    start_section(".text", align(addr - image_base, DEFAULT_SECTION_ALIGNMENT))
-                current_section["entries"].append({
-                    "address": addr,
-                    "asm": opcode_part,
-                    "raw_bytes": raw_bytes,
-                })
+            if comment:
+                raw_bytes = parse_bytes_comment(comment)
+            if opcode.lower().startswith('db'):
+                raw_bytes = parse_db_bytes(opcode[2:].strip())
+                if current is None:
+                    start_section('.text', align(addr - image_base, DEFAULT_SECTION_ALIGNMENT), 0x1000, 0)
+                current['entries'].append({'address': addr, 'asm': None, 'raw_bytes': raw_bytes})
+            elif opcode:
+                if current is None:
+                    start_section('.text', align(addr - image_base, DEFAULT_SECTION_ALIGNMENT), 0x1000, 0)
+                current['entries'].append({'address': addr, 'asm': opcode, 'raw_bytes': raw_bytes})
 
     if not sections:
-        raise ValueError("No disassembly entries found in listing")
+        raise ValueError('No disassembly entries found')
 
     if len(sections) == 1:
         sec = sections[0]
-        min_addr = min(entry["address"] for entry in sec["entries"] if entry["address"] is not None)
-        sec["va"] = align(min_addr - image_base, DEFAULT_SECTION_ALIGNMENT)
+        min_addr = min(e['address'] for e in sec['entries'] if e['address'] is not None)
+        sec['va'] = align(min_addr - image_base, DEFAULT_SECTION_ALIGNMENT)
 
     return sections
 
 
-def parse_disasm_addresses(path, image_base=DEFAULT_IMAGE_BASE):
-    addresses = []
-    line_pattern = re.compile(r"^\s*0x([0-9A-Fa-f]+):")
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            match = line_pattern.match(line)
-            if not match:
-                continue
-            addr = int(match.group(1), 16)
-            addresses.append(addr)
-    return addresses
-
-
-def compare_files(path_a, path_b, chunk_size=8192):
-    len_a = os.path.getsize(path_a)
-    len_b = os.path.getsize(path_b)
-    mismatches = 0
-    first_mismatch = None
-    bytes_compared = 0
-
-    with open(path_a, "rb") as fa, open(path_b, "rb") as fb:
-        while True:
-            chunk_a = fa.read(chunk_size)
-            chunk_b = fb.read(chunk_size)
-            if not chunk_a and not chunk_b:
-                break
-            for i, (byte_a, byte_b) in enumerate(zip(chunk_a, chunk_b)):
-                if byte_a != byte_b:
-                    mismatches += 1
-                    if first_mismatch is None:
-                        first_mismatch = bytes_compared + i
-            bytes_compared += min(len(chunk_a), len(chunk_b))
-            if not chunk_a or not chunk_b:
-                break
-
-    extra_bytes = abs(len_a - len_b)
-    same = mismatches == 0 and len_a == len_b
-    return {
-        "same": same,
-        "len_a": len_a,
-        "len_b": len_b,
-        "mismatches": mismatches,
-        "bytes_compared": bytes_compared,
-        "first_mismatch": first_mismatch,
-        "extra_bytes": extra_bytes,
-    }
-
-
-def find_original_section(sections, section):
-    for sec in sections:
-        if sec["name"] == section["name"]:
-            return sec
-    for sec in sections:
-        if sec["virtual_address"] == section["va"]:
-            return sec
-    return None
-
-
-def patch_section_bytes(section, original_bytes, image_base):
+def assemble_section(section, image_base=DEFAULT_IMAGE_BASE, fill_byte=0x00):
     if Ks is None:
-        raise ImportError("keystone-engine is required for disassembly reconstruction. Install with: pip install keystone-engine")
-
+        raise ImportError('keystone-engine is required: pip install keystone-engine')
     ks = Ks(KS_ARCH_X86, KS_MODE_32)
-    section_start = section["va"] + image_base
-    data = bytearray(original_bytes)
-
-    for entry in section["entries"]:
-        if entry["address"] is None:
-            continue
-
-        raw_bytes = entry["raw_bytes"]
-        if raw_bytes is None:
-            if entry["asm"] is None:
-                continue
-            try:
-                raw_bytes, _ = ks.asm(entry["asm"], entry["address"])
-            except Exception as exc:
-                raise ValueError(f"Assembly failed at 0x{entry['address']:X}: {entry['asm']}: {exc}")
-
-        offset = entry["address"] - section_start
-        if offset < 0 or offset + len(raw_bytes) > len(data):
-            raise ValueError(
-                f"Entry at 0x{entry['address']:X} is outside section bounds "
-                f"(section start 0x{section_start:X}, size {len(data)})"
-            )
-
-        for i, byte in enumerate(raw_bytes):
-            data[offset + i] = byte
-
-    return data
-
-
-def create_pe_from_template(input_path, sections, output_path, image_base=DEFAULT_IMAGE_BASE,
-                            entry_point=None):
-    with open(input_path, "rb") as f:
-        original = bytearray(f.read())
-
-    original_sections = parse_pe(original)
-    for section in sections:
-        orig_section = find_original_section(original_sections, section)
-        if orig_section is None:
-            raise ValueError(f"No matching section in template for disassembly section: {section['name']}")
-
-        raw_ptr = orig_section["raw_ptr"]
-        raw_size = orig_section["raw_size"]
-        original_data = original[raw_ptr:raw_ptr + raw_size]
-        patched = patch_section_bytes(section, original_data, image_base)
-        original[raw_ptr:raw_ptr + len(patched)] = patched
-
-    if entry_point is not None:
-        e_lfanew = struct.unpack_from("<I", original, 0x3C)[0]
-        optional_header_offset = e_lfanew + 0x18
-        struct.pack_into("<I", original, optional_header_offset + 0x10, entry_point - image_base)
-
-    with open(output_path, "wb") as f:
-        f.write(original)
-
-
-def print_compare_results(result, rebuilt_path, original_path):
-    if result["same"]:
-        print(f"Verified: rebuilt EXE matches original file exactly ({result['len_a']} bytes).")
-        return
-
-    print("Verification: rebuilt EXE differs from original file.")
-    print(f"  Rebuilt: {result['len_a']} bytes")
-    print(f"  Original: {result['len_b']} bytes")
-    print(f"  Compared: {result['bytes_compared']} bytes")
-    if result["mismatches"]:
-        print(f"  Mismatched bytes: {result['mismatches']}")
-    if result["first_mismatch"] is not None:
-        print(f"  First mismatch at offset 0x{result['first_mismatch']:X}")
-    if result["extra_bytes"]:
-        print(f"  Length difference: {result['extra_bytes']} extra bytes")
-
-
-def assemble_section(section, image_base, fill_byte=0x00):
-    if Ks is None:
-        raise ImportError("keystone-engine is required for disassembly reconstruction. Install with: pip install keystone-engine")
-
-    ks = Ks(KS_ARCH_X86, KS_MODE_32)
-    entries = section["entries"]
-    section_start = section["va"] + image_base
-
+    entries = section['entries']
+    section_start = section['va'] + image_base
     assembled_lengths = []
     section_end = 0
     for entry in entries:
-        addr = entry["address"]
+        addr = entry['address']
         if addr is None:
             assembled_lengths.append(None)
             continue
-
-        if entry["raw_bytes"] is not None:
-            length = len(entry["raw_bytes"])
-        elif entry["asm"]:
-            encoding, _ = ks.asm(entry["asm"], addr)
+        if entry['raw_bytes'] is not None:
+            length = len(entry['raw_bytes'])
+        elif entry['asm']:
+            encoding, _ = ks.asm(entry['asm'], addr)
             length = len(encoding)
         else:
-            raise ValueError("Disassembly entry missing bytes and assembly text")
-
+            raise ValueError('Entry missing bytes and asm')
         assembled_lengths.append(length)
         section_end = max(section_end, addr + length)
-
     if section_end <= section_start:
-        raise ValueError("Section has no valid entries or computed size")
-
+        raise ValueError('Section has no valid entries')
     size = align(section_end - section_start, DEFAULT_FILE_ALIGNMENT)
     if size == 0:
         size = DEFAULT_FILE_ALIGNMENT
     data = bytearray([fill_byte] * size)
-
     for entry, length in zip(entries, assembled_lengths):
-        addr = entry["address"]
+        addr = entry['address']
         if addr is None:
-            if entry["raw_bytes"] is None:
-                raise ValueError("Raw data entry missing byte values")
+            if entry['raw_bytes'] is None:
+                raise ValueError('Raw data entry missing bytes')
             offset = 0
-            for i, byte in enumerate(entry["raw_bytes"]):
-                if data[offset + i] != fill_byte and data[offset + i] != byte:
-                    raise ValueError(
-                        f"Byte conflict at raw data offset 0x{offset + i:X}: existing 0x{data[offset+i]:02X} vs new 0x{byte:02X}"
-                    )
-                data[offset + i] = byte
+            for i, b in enumerate(entry['raw_bytes']):
+                data[offset + i] = b
             continue
-
         offset = addr - section_start
         if offset < 0:
-            raise ValueError(f"Address 0x{addr:X} is below section start 0x{section_start:X}")
-
-        if entry["raw_bytes"] is not None:
-            raw_bytes = entry["raw_bytes"]
-            if offset + len(raw_bytes) > len(data):
-                end_addr = addr + len(raw_bytes) - 1
-                raise ValueError(f"Raw byte range exceeds section bounds at 0x{end_addr:X}")
-            for i, byte in enumerate(raw_bytes):
-                if data[offset + i] != fill_byte and data[offset + i] != byte:
-                    raise ValueError(
-                        f"Byte conflict at 0x{addr + i:X}: existing 0x{data[offset+i]:02X} vs new 0x{byte:02X}"
-                    )
-                data[offset + i] = byte
+            raise ValueError('Address below section start')
+        if entry['raw_bytes'] is not None:
+            rb = entry['raw_bytes']
+            for i, b in enumerate(rb):
+                data[offset + i] = b
             continue
-
-        if entry["asm"] is None:
-            continue
-
-        try:
-            encoding, _ = ks.asm(entry["asm"], addr)
-        except Exception as exc:
-            raise ValueError(f"Assembly failed at 0x{addr:X}: {entry['asm']}: {exc}")
-
-        if offset + len(encoding) > len(data):
-            raise ValueError(f"Instruction at 0x{addr:X} exceeds section bounds")
-        for i, byte in enumerate(encoding):
-            if data[offset + i] != fill_byte and data[offset + i] != byte:
-                raise ValueError(
-                    f"Byte conflict at 0x{addr + i:X}: existing 0x{data[offset+i]:02X} vs new 0x{byte:02X}"
-                )
-            data[offset + i] = byte
-
+        encoding, _ = ks.asm(entry['asm'], addr)
+        for i, b in enumerate(encoding):
+            data[offset + i] = b
     actual_size = section_end - section_start
     return data[:actual_size]
 
 
-def create_pe(sections, output_path, image_base=DEFAULT_IMAGE_BASE, entry_point=None,
-              section_alignment=DEFAULT_SECTION_ALIGNMENT, file_alignment=DEFAULT_FILE_ALIGNMENT):
-    if entry_point is None:
-        entry_point = sections[0]["entries"][0]["address"]
+def parse_pe(data):
+    if len(data) < 0x40 or data[:2] != IMAGE_DOS_SIGNATURE:
+        raise ValueError('Not a valid DOS header / PE file')
+    e_lfanew = struct.unpack_from('<I', data, 0x3C)[0]
+    if e_lfanew + 4 > len(data) or data[e_lfanew:e_lfanew + 4] != IMAGE_NT_SIGNATURE:
+        raise ValueError('Not a valid PE header')
+    fh_off = e_lfanew + 4
+    NumberOfSections = struct.unpack_from('<H', data, fh_off + 2)[0]
+    SizeOfOptionalHeader = struct.unpack_from('<H', data, fh_off + 16)[0]
+    optional_header_offset = fh_off + 20
+    section_table_offset = optional_header_offset + SizeOfOptionalHeader
+    secs = []
+    for i in range(NumberOfSections):
+        off = section_table_offset + i * IMAGE_SIZEOF_SECTION_HEADER
+        if off + IMAGE_SIZEOF_SECTION_HEADER > len(data):
+            break
+        name = data[off:off+8].rstrip(b'\x00').decode('ascii', errors='ignore')
+        VirtualSize, VirtualAddress, SizeOfRawData, PointerToRawData, _, _, _, _, Characteristics = struct.unpack_from('<IIIIIIHHI', data, off+8)
+        secs.append({'name': name, 'virtual_size': VirtualSize, 'virtual_address': VirtualAddress, 'raw_size': SizeOfRawData, 'raw_ptr': PointerToRawData, 'characteristics': Characteristics})
+    return secs
 
+
+def patch_section_bytes(section, original_bytes, image_base=DEFAULT_IMAGE_BASE):
+    if Ks is None:
+        raise ImportError('keystone-engine is required: pip install keystone-engine')
+    ks = Ks(KS_ARCH_X86, KS_MODE_32)
+    section_start = section['va'] + image_base
+    data = bytearray(original_bytes)
+    for entry in section['entries']:
+        if entry['address'] is None:
+            continue
+        rb = entry.get('raw_bytes')
+        if rb is None:
+            if entry.get('asm') is None:
+                continue
+            rb, _ = ks.asm(entry['asm'], entry['address'])
+        offset = entry['address'] - section_start
+        for i, b in enumerate(rb):
+            data[offset + i] = b
+    return data
+
+
+def create_pe_from_template(input_path, sections, output_path, image_base=DEFAULT_IMAGE_BASE, entry_point=None):
+    with open(input_path, 'rb') as f:
+        orig = bytearray(f.read())
+    orig_secs = parse_pe(orig)
+    for section in sections:
+        match = None
+        for s in orig_secs:
+            if s['name'] == section['name'] or s['virtual_address'] == section['va']:
+                match = s
+                break
+        if match is None:
+            raise ValueError('No matching section in template for ' + section['name'])
+        raw_ptr = match['raw_ptr']
+        raw_size = match['raw_size']
+        original_data = orig[raw_ptr:raw_ptr + raw_size]
+        patched = patch_section_bytes(section, original_data, image_base)
+        orig[raw_ptr:raw_ptr + len(patched)] = patched
+    if entry_point is not None:
+        e_lfanew = struct.unpack_from('<I', orig, 0x3C)[0]
+        optional_header_offset = e_lfanew + 0x18
+        struct.pack_into('<I', orig, optional_header_offset + 0x10, entry_point - image_base)
+    with open(output_path, 'wb') as f:
+        f.write(orig)
+
+
+def create_pe(sections, output_path, image_base=DEFAULT_IMAGE_BASE, entry_point=None, section_alignment=DEFAULT_SECTION_ALIGNMENT, file_alignment=DEFAULT_FILE_ALIGNMENT, header_bin=None, section_bins=None, inject_bins=None):
+    # assemble sections
+    if entry_point is None:
+        entry_point = sections[0]['entries'][0]['address']
     section_datas = []
     for section in sections:
         section_bytes = assemble_section(section, image_base)
         section_datas.append((section, section_bytes))
+    section_datas.sort(key=lambda it: it[0]['va'])
+    min_header_size = align(0x80 + 4 + 20 + 0xE0 + len(section_datas) * IMAGE_SIZEOF_SECTION_HEADER, file_alignment)
+    raw_offsets = [s.get('raw_offset') for s, _ in section_datas if s.get('raw_offset') is not None]
+    headers_size = max(min_header_size, align(min(raw_offsets), file_alignment)) if raw_offsets else min_header_size
+    section_file_sizes = []
+    for section, data_bytes in section_datas:
+        raw_size = section.get('raw_size')
+        if raw_size is None:
+            raw_size = align(len(data_bytes), file_alignment)
+        elif raw_size < len(data_bytes):
+            raise ValueError('Declared raw_size too small')
+        section_file_sizes.append(section.get('raw_offset', headers_size) + raw_size)
+    output_size = max(headers_size, max(section_file_sizes, default=0))
 
-    section_datas.sort(key=lambda item: item[0]["va"])
-    headers_size = align(0x80 + 4 + 20 + 0xE0 + len(section_datas) * IMAGE_SIZEOF_SECTION_HEADER, file_alignment)
-    total_raw_size = sum(align(len(data_bytes), file_alignment) for _, data_bytes in section_datas)
-    image_size = align(section_datas[-1][0]["va"] + len(section_datas[-1][1]), section_alignment)
+    # If header bin provided, write it and then place section blobs at raw offsets
+    if header_bin:
+        header_bytes = Path(header_bin).read_bytes()
+        if len(header_bytes) > output_size:
+            output_size = len(header_bytes)
+        out = bytearray(output_size)
+        out[0:len(header_bytes)] = header_bytes
+        if inject_bins:
+            for off, path in inject_bins.items():
+                b = Path(path).read_bytes()
+                end = off + len(b)
+                if end > len(out):
+                    out.extend(b'\x00' * (end - len(out)))
+                out[off:off+len(b)] = b
+        for section, data_bytes in section_datas:
+            raw_off = section.get('raw_offset', headers_size)
+            if section_bins and section['name'] in section_bins:
+                sec_data = Path(section_bins[section['name']]).read_bytes()
+            else:
+                sec_data = bytes(data_bytes)
+            end = raw_off + len(sec_data)
+            if end > len(out):
+                out.extend(b'\x00' * (end - len(out)))
+            out[raw_off:raw_off+len(sec_data)] = sec_data
+        Path(output_path).write_bytes(out)
+        return
 
-    output = bytearray(headers_size + total_raw_size)
-    output[0:2] = IMAGE_DOS_SIGNATURE
-    struct.pack_into("<I", output, 0x3C, 0x80)
+    # synthesize headers
+    out = bytearray(output_size)
+    out[0:2] = IMAGE_DOS_SIGNATURE
+    struct.pack_into('<I', out, 0x3C, 0x80)
     if headers_size > 0x40 + len(b"This program cannot be run in DOS mode.\r\n$"):
-        output[0x40:0x40 + 36] = b"This program cannot be run in DOS mode.\r\n$"
-
-    pe_offset = 0x80
-    output[pe_offset:pe_offset + 4] = IMAGE_NT_SIGNATURE
-    file_header_offset = pe_offset + 4
-    struct.pack_into("<HHIIIHH", output, file_header_offset,
-                     IMAGE_FILE_MACHINE_I386,
-                     len(section_datas),
-                     0,
-                     0,
-                     0,
-                     0xE0,
-                     0x010F)
-
-    optional_offset = file_header_offset + 20
+        out[0x40:0x40+36] = b"This program cannot be run in DOS mode.\r\n$"
+    pe_off = 0x80
+    out[pe_off:pe_off+4] = IMAGE_NT_SIGNATURE
+    fh_off = pe_off + 4
+    struct.pack_into('<HHIIIHH', out, fh_off, IMAGE_FILE_MACHINE_I386, len(section_datas), 0, 0, 0, 0xE0, 0x010F)
+    opt_off = fh_off + 20
     size_of_code = align(len(section_datas[0][1]), file_alignment)
-    size_of_initialized_data = sum(align(len(data_bytes), file_alignment) for _, data_bytes in section_datas[1:])
-    base_of_data = section_datas[1][0]["va"] if len(section_datas) > 1 else 0
+    size_of_init = sum(align(len(d), file_alignment) for _, d in section_datas[1:])
+    base_of_data = section_datas[1][0]['va'] if len(section_datas) > 1 else 0
     optional_header = bytearray(0xE0)
-    struct.pack_into("<HBBIIIIII", optional_header, 0,
-                     0x10B,
-                     0,
-                     0,
-                     size_of_code,
-                     size_of_initialized_data,
-                     0,
-                     entry_point - image_base,
-                     section_datas[0][0]["va"],
-                     base_of_data)
-    struct.pack_into("<III", optional_header, 0x1C,
-                     image_base,
-                     section_alignment,
-                     file_alignment)
-    struct.pack_into("<HHHHHH", optional_header, 0x28,
-                     4,
-                     0,
-                     0,
-                     0,
-                     4,
-                     0)
-    struct.pack_into("<III", optional_header, 0x34,
-                     0,
-                     image_size,
-                     headers_size)
-    struct.pack_into("<IIIIHHIIIIII", optional_header, 0x40,
-                     0,
-                     0,
-                     image_size,
-                     headers_size,
-                     0,
-                     3,
-                     0,
-                     0,
-                     0,
-                     0,
-                     0,
-                     16)
-    output[optional_offset:optional_offset + len(optional_header)] = optional_header
-
-    section_table_offset = optional_offset + 0xE0
-    raw_offset = headers_size
+    struct.pack_into('<HBBIIIIII', optional_header, 0, 0x10B, 0, 0, size_of_code, size_of_init, 0, entry_point - image_base, section_datas[0][0]['va'], base_of_data)
+    struct.pack_into('<III', optional_header, 0x1C, image_base, section_alignment, file_alignment)
+    struct.pack_into('<HHHHHH', optional_header, 0x28, 4, 0, 0, 0, 4, 0)
+    image_size = align(section_datas[-1][0]['va'] + len(section_datas[-1][1]), section_alignment)
+    struct.pack_into('<III', optional_header, 0x34, 0, image_size, headers_size)
+    struct.pack_into('<IIIIHHIIIIII', optional_header, 0x40, 0, 0, image_size, headers_size, 0, 3, 0, 0, 0, 0, 0, 16)
+    out[opt_off:opt_off+len(optional_header)] = optional_header
+    sect_table_off = opt_off + 0xE0
+    raw_ptr = headers_size
     for idx, (section, data_bytes) in enumerate(section_datas):
-        section_header_offset = section_table_offset + idx * IMAGE_SIZEOF_SECTION_HEADER
-        name_bytes = section["name"].encode("ascii", errors="ignore")[:8].ljust(8, b"\x00")
-        virtual_size = len(data_bytes)
-        raw_size = align(virtual_size, file_alignment)
-        struct.pack_into("<8sIIIIIIHHI", output, section_header_offset,
-                         name_bytes,
-                         virtual_size,
-                         section["va"],
-                         raw_size,
-                         raw_offset,
-                         0,
-                         0,
-                         0,
-                         0,
-                         0x60000020)
-        output[raw_offset:raw_offset + len(data_bytes)] = data_bytes
-        raw_offset += raw_size
+        sh_off = sect_table_off + idx * IMAGE_SIZEOF_SECTION_HEADER
+        name = section['name'].encode('ascii', errors='ignore')[:8].ljust(8, b'\x00')
+        vsize = len(data_bytes)
+        rsize = align(vsize, file_alignment)
+        struct.pack_into('<8sIIIIIIHHI', out, sh_off, name, vsize, section['va'], rsize, raw_ptr, 0, 0, 0, 0, 0x60000020)
+        out[raw_ptr:raw_ptr+len(data_bytes)] = data_bytes
+        raw_ptr += rsize
 
-    with open(output_path, "wb") as f:
-        f.write(output)
+    if inject_bins:
+        for off, path in inject_bins.items():
+            b = Path(path).read_bytes()
+            end = off + len(b)
+            if end > len(out):
+                out.extend(b'\x00' * (end - len(out)))
+            out[off:off+len(b)] = b
+
+    Path(output_path).write_bytes(out)
+
+
+def compare_files(a, b, chunk_size=8192):
+    la = Path(a).stat().st_size
+    lb = Path(b).stat().st_size
+    mismatches = 0
+    first = None
+    compared = 0
+    with open(a, 'rb') as fa, open(b, 'rb') as fb:
+        while True:
+            ca = fa.read(chunk_size)
+            cb = fb.read(chunk_size)
+            if not ca and not cb:
+                break
+            for i, (x, y) in enumerate(zip(ca, cb)):
+                if x != y:
+                    mismatches += 1
+                    if first is None:
+                        first = compared + i
+            compared += min(len(ca), len(cb))
+            if not ca or not cb:
+                break
+    return {'same': mismatches == 0 and la == lb, 'len_a': la, 'len_b': lb, 'mismatches': mismatches, 'first_mismatch': first, 'bytes_compared': compared, 'extra_bytes': abs(la - lb)}
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Reassemble a 32-bit PE executable from an original EXE or a disassembly listing."
-    )
-    parser.add_argument("--input", help="Optional source PE file to copy or use as a template and compare against the rebuilt output")
-    parser.add_argument("--disasm", help="Disassembly listing to rebuild from")
-    parser.add_argument("--output", required=True, help="Output EXE file")
-    parser.add_argument("--entry", help="Optional entry point address, e.g. 0x401000")
-    parser.add_argument("--image-base", type=lambda x: int(x, 0), default=DEFAULT_IMAGE_BASE,
-                        help="Image base for the rebuilt PE")
-    parser.add_argument("--section-alignment", type=lambda x: int(x, 0), default=DEFAULT_SECTION_ALIGNMENT)
-    parser.add_argument("--file-alignment", type=lambda x: int(x, 0), default=DEFAULT_FILE_ALIGNMENT)
-    parser.add_argument("--verify", help="Verify disassembly listing addresses against the source EXE", metavar="DISASM")
-
-    args = parser.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument('--input', help='Optional source PE file to copy or use as template')
+    p.add_argument('--disasm', help='Disassembly listing to rebuild from')
+    p.add_argument('--output', required=True)
+    p.add_argument('--entry')
+    p.add_argument('--image-base', type=lambda x: int(x, 0), default=DEFAULT_IMAGE_BASE)
+    p.add_argument('--section-alignment', type=lambda x: int(x, 0), default=DEFAULT_SECTION_ALIGNMENT)
+    p.add_argument('--file-alignment', type=lambda x: int(x, 0), default=DEFAULT_FILE_ALIGNMENT)
+    p.add_argument('--header-bin', help='Binary to write at offset 0')
+    p.add_argument('--section-bin', action='append', help='NAME=PATH')
+    p.add_argument('--inject', action='append', help='OFF=PATH (OFF hex)')
+    p.add_argument('--verify', help='Verify disasm addresses against source EXE')
+    args = p.parse_args()
 
     if args.disasm:
         if Ks is None:
-            print("Error: keystone-engine is required. Install it with: pip install keystone-engine")
+            print('Error: keystone-engine is required')
             sys.exit(1)
-
         sections = parse_disasm_listing(args.disasm, args.image_base)
-        entry_point = int(args.entry, 0) if args.entry else None
+        entry = int(args.entry, 0) if args.entry else None
+        section_bins = {}
+        if args.section_bin:
+            for it in args.section_bin:
+                if '=' not in it:
+                    print('bad --section-bin', it); sys.exit(1)
+                n, path = it.split('=', 1); section_bins[n] = path
+        injects = {}
+        if args.inject:
+            for it in args.inject:
+                if '=' not in it:
+                    print('bad --inject', it); sys.exit(1)
+                off_s, path = it.split('=', 1)
+                inj_off = int(off_s, 0)
+                injects[inj_off] = path
         try:
             if args.input and os.path.isfile(args.input):
-                create_pe_from_template(args.input, sections, args.output,
-                                        image_base=args.image_base,
-                                        entry_point=entry_point)
+                create_pe_from_template(args.input, sections, args.output, image_base=args.image_base, entry_point=entry)
             else:
-                create_pe(sections, args.output, image_base=args.image_base,
-                          entry_point=entry_point,
-                          section_alignment=args.section_alignment,
-                          file_alignment=args.file_alignment)
-        except Exception as exc:
-            print(f"Failed to rebuild EXE from disassembly: {exc}")
-            sys.exit(1)
-        print(f"Rebuilt EXE written to {args.output}")
-        if args.input:
-            if os.path.isfile(args.input):
-                result = compare_files(args.output, args.input)
-                print_compare_results(result, args.output, args.input)
-            else:
-                print(f"Warning: original file for comparison not found: {args.input}")
+                create_pe(sections, args.output, image_base=args.image_base, entry_point=entry, section_alignment=args.section_alignment, file_alignment=args.file_alignment, header_bin=args.header_bin, section_bins=section_bins if section_bins else None, inject_bins=injects if injects else None)
+        except Exception as e:
+            print('Failed to rebuild EXE:', e); sys.exit(1)
+        print('Rebuilt EXE written to', args.output)
         return
 
     if not args.input:
-        print("Error: either --input or --disasm must be provided")
+        print('Error: either --input or --disasm must be provided')
         sys.exit(1)
-
-    if not os.path.isfile(args.input):
-        print(f"File not found: {args.input}")
-        sys.exit(1)
-
-    try:
-        shutil.copyfile(args.input, args.output)
-    except OSError as exc:
-        print(f"Unable to write output file: {exc}")
-        sys.exit(1)
-
-    print(f"Byte-identical EXE written to {args.output}")
-
-    if args.verify:
-        if not os.path.isfile(args.verify):
-            print(f"Disassembly file not found: {args.verify}")
-            sys.exit(1)
-        try:
-            with open(args.input, "rb") as f:
-                data = f.read()
-            sections = parse_pe(data)
-            addresses = parse_disasm_addresses(args.verify)
-            if not addresses:
-                raise ValueError("No addresses found in the disassembly file")
-            min_addr = min(addresses)
-            max_addr = max(addresses)
-            section = None
-            for sec in sections:
-                start = sec["virtual_address"]
-                end = start + sec["virtual_size"]
-                if start <= min_addr - args.image_base and max_addr - args.image_base < end:
-                    section = sec
-                    break
-            if section is None:
-                print("Warning: no matching section found for disassembly addresses.")
-            else:
-                print(f"Disassembly appears to map inside section: {section['name']}")
-                print(f"Section raw data: offset={section['raw_ptr']} size={section['raw_size']}")
-                print(f"Parsed {len(addresses)} instruction addresses from {args.verify}")
-        except Exception as exc:
-            print(f"Verification failed: {exc}")
-            sys.exit(1)
+    shutil.copyfile(args.input, args.output)
+    print('Byte-identical EXE written to', args.output)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
