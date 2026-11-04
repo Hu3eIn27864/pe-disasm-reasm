@@ -1,87 +1,56 @@
 # x86 PE Disassembler and Reassembler
 
-This repository contains Python scripts for disassembling a 32-bit x86 PE executable and rebuilding it from a disassembly listing.
+A set of Python experiments for inspecting 32-bit x86 Portable Executable files, producing assembly-oriented listings and rebuilding PE images from those listings.
 
-## Files
+> **Status: experimental.** Reassembly fidelity depends on the listing format, preserved metadata and the specific input executable. A successful output file is not automatically byte-identical, loadable or semantically equivalent.
 
-- `disassemble_x86_pe.py` - basic PE disassembler for `.text` section.
-- `disassemble_x86_pe_v2.py` - improved disassembler covering sections and exact bytes.
-- `reassemble_x86_pe.py` - rebuilds a PE executable from a disassembly listing. If `--input` is provided, it uses the original EXE as a template for exact-byte reconstruction.
-- `game.exe` - original executable under analysis.
-- `game_disasm_v2.txt` - generated disassembly listing from `disassemble_x86_pe_v2.py`.
+## Tools
+
+- `disassemble_x86_pe.py` — initial disassembly experiment for the PE code section.
+- `disassemble_x86_pe_v2.py` — expanded section/byte-aware listing.
+- `reassemble_x86_pe.py` — rebuild experiment with optional original-file template support.
+- Optional extraction/injection helpers may exist in the working tree; inspect their CLI help before use.
 
 ## Requirements
 
-- Python 3
-- `keystone-engine` (for assembly reconstruction)
+- Python 3.
+- `keystone-engine` for assembly reconstruction (install only if using the reassembler).
 
-Install dependencies with:
-
-```powershell
-pip install keystone-engine
+```bash
+python -m pip install keystone-engine
 ```
 
 ## Usage
 
-### Disassemble
+Inspect a PE file you are authorized to analyze:
 
-```powershell
-python disassemble_x86_pe_v2.py game.exe -o game_disasm_v2.txt
+```bash
+python disassemble_x86_pe_v2.py /path/to/input.exe -o analysis.asm
 ```
 
-### Rebuild from disassembly
+Reassemble a listing:
 
-```powershell
-python reassemble_x86_pe.py --disasm game_disasm_v2.txt --output rebuilt_game.exe --entry 0x401000
+```bash
+python reassemble_x86_pe.py --disasm analysis.asm --output rebuilt.exe --entry 0x401000
 ```
 
-### Rebuild using original EXE as a template (byte-identical)
+If using template or binary-injection options, keep all source binaries and extracted sections local. Those modes depend on the exact input and should not be represented as standalone reconstruction unless a separate test proves it.
 
-```powershell
-python reassemble_x86_pe.py --input game.exe --disasm game_disasm_v2.txt --output rebuilt_template_game.exe
-```
+## Validation checklist
 
-### Exact-byte rebuild using injected binaries
+- Compare output file size and SHA-256.
+- Compare headers, sections, data directories and overlays.
+- Check relocation and import behavior.
+- Open the output with an independent PE parser.
+- Test execution only in a safe, isolated environment and only when authorized.
+- Record byte equality separately from loadability and semantic equivalence.
 
-If you need a byte-for-byte identical EXE but do not want to rely on the original at build-time,
-you can extract exact header/section blobs and inject them into the rebuilt output.
+## Roadmap
 
-1. Extract header and resource binaries (example helper):
+See [docs/ROADMAP.md](docs/ROADMAP.md) for a staged plan and provisional time estimates.
 
-```powershell
-python extract_bins.py
-# writes header.bin and rsrc.bin
-```
+## Repository hygiene and legal use
 
-2. Rebuild using injected blobs:
+Do not commit commercial executables, DLLs, proprietary game files, raw disassembly dumps or extracted resources. Keep test binaries outside Git and use synthetic or redistributable fixtures. Analyze only files you are legally entitled to inspect.
 
-```powershell
-python reassemble_x86_pe.py --disasm game_disasm_v2.txt --header-bin header.bin --section-bin .rsrc=rsrc.bin --output rebuilt_with_blobs.exe
-```
-
-### New CLI options
-
-- `--header-bin PATH` : write the exact binary `PATH` at file offset 0 (useful to preserve DOS stub and PE header bytes).
-- `--section-bin NAME=PATH` : override the assembled contents of section `NAME` with the file at `PATH` (can be repeated).
-- `--inject OFF=PATH` : inject binary `PATH` at raw file offset `OFF` (hex or 0x-prefixed allowed).
-
-## Notes
-
-- `keystone-engine` is required for assembling instructions back into bytes. Install with `pip install keystone-engine`.
-- The template mode (`--input`) remains the simplest way to produce an exact-byte rebuild when the original EXE is available.
-- The repository now ignores generated blobs (`header.bin`, `rsrc.bin`, `rebuilt_with_blobs.exe`) via `.gitignore`.
-
-- Important: To produce a byte-for-byte identical rebuild you need access to the original `game.exe` file and a legally licensed copy of the game. Do not attempt to reconstruct or distribute binaries you do not own or have rights to.
-
-- Wichtig: Für eine exakte (byte-identische) Rekonstruktion wird die Original-EXE (`game.exe`) benötigt sowie eine rechtmäßig erworbene Kopie des Spiels. Verwende oder verbreite keine Binärdateien, die dir nicht gehören oder für die du keine Lizenz hast.
-
-## GitHub push
-
-Push from your machine as usual (this repo already contains commits and was pushed in-session):
-
-```powershell
-cd C:\Users\salma\Documents\vscode5
-git add README.md
-git commit -m "docs: update README with new rebuild options and examples"
-git push origin master
-```
+Remove machine-specific paths, usernames and instructions from documentation before publishing. Keep examples portable across Windows, Linux and macOS where possible.
